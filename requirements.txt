@@ -1,0 +1,16 @@
+# DeciderAgent 依赖
+
+# 核心依赖（至少安装一个LLM SDK）
+anthropic>=0.39.0      # Anthropic Claude
+openai>=1.50.0         # OpenAI GPT-4o / 通义千问(兼容接口)
+google-generativeai>=0.8.0  # Google Gemini
+
+# 图像处理
+Pillow>=10.0.0         # Gemini后端需要
+opencv-python>=4.8.0   # Numpy数组图像处理（可选，用于test_client的numpy模式）
+
+# HTTP服务依赖
+fastapi>=0.115.0       # Web框架
+uvicorn[standard]>=0.32.0  # ASGI服务器
+python-multipart>=0.0.9    # 文件上传支持
+requests>=2.31.0       # HTTP客户端（用于test_client）
