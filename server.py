@@ -66,6 +66,11 @@ class Base64DecisionRequest(BaseModel):
         }
 
 
+class InstructionRequest(BaseModel):
+    """指令请求模型"""
+    instruction: str = Field(..., description="自然语言指令")
+
+
 # 创建FastAPI应用
 app = FastAPI(
     title="驾驶决策Agent API",
@@ -202,6 +207,8 @@ async def decide_from_upload(
         )
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"决策分析失败: {str(e)}")
 
     finally:
@@ -258,6 +265,8 @@ async def decide_from_base64(request: Base64DecisionRequest):
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"决策分析失败: {str(e)}")
 
     finally:
@@ -299,6 +308,42 @@ async def get_valid_decisions():
         "valid_decisions": VALID_DECISIONS,
         "count": len(VALID_DECISIONS)
     }
+
+
+@app.post("/instruct", tags=["指令"])
+async def add_instruction(request: InstructionRequest):
+    """添加自然语言指令"""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent未初始化")
+
+    agent.add_instruction(request.instruction)
+    return {
+        "success": True,
+        "instruction": request.instruction,
+        "pending_count": len(agent.get_pending_instructions())
+    }
+
+
+@app.get("/instruct", tags=["指令"])
+async def get_instructions():
+    """获取待处理指令"""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent未初始化")
+
+    return {
+        "instructions": agent.get_pending_instructions(),
+        "count": len(agent.get_pending_instructions())
+    }
+
+
+@app.delete("/instruct", tags=["指令"])
+async def clear_instructions():
+    """清除所有待处理指令"""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent未初始化")
+
+    agent.clear_instructions()
+    return {"success": True, "message": "所有指令已清除"}
 
 
 def start_server(

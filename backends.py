@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
 from config import VALID_DECISIONS, DEFAULT_DECISION, MAX_TOKENS
-from prompts import SYSTEM_PROMPT, CAMERA_LABELS, ANALYSIS_REQUEST
+from prompts import SYSTEM_PROMPT, CAMERA_LABELS, ANALYSIS_REQUEST, USER_INSTRUCTION_MESSAGE
 
 
 @dataclass
@@ -118,7 +118,7 @@ class LLMBackend(ABC):
             return response_text, DEFAULT_DECISION
 
     @abstractmethod
-    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "") -> str:
+    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "", instructions: Optional[List[str]] = None) -> str:
         """
         调用LLM API
 
@@ -126,13 +126,14 @@ class LLMBackend(ABC):
             images: 四个摄像头的图像
             history: 对话历史记录（可选）
             time_info: 时间戳信息
+            instructions: 用户自然语言指令列表（可选）
 
         Returns:
             LLM的原始响应文本
         """
         pass
 
-    def decide(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "") -> DecisionResult:
+    def decide(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "", instructions: Optional[List[str]] = None) -> DecisionResult:
         """
         根据图像做出决策
 
@@ -140,11 +141,12 @@ class LLMBackend(ABC):
             images: 四个摄像头的图像
             history: 对话历史记录（可选）
             time_info: 时间戳信息
+            instructions: 用户自然语言指令列表（可选）
 
         Returns:
             决策结果
         """
-        raw_response = self.call_api(images, history, time_info)
+        raw_response = self.call_api(images, history, time_info, instructions)
         analysis, decision = self.parse_response(raw_response)
         return DecisionResult(
             analysis=analysis,
@@ -197,13 +199,22 @@ class AnthropicBackend(LLMBackend):
         content.append({"type": "text", "text": ANALYSIS_REQUEST})
         return content
 
-    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "") -> str:
+    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "", instructions: Optional[List[str]] = None) -> str:
         content = self.build_image_content(images, time_info)
 
         # 构建消息列表（包含历史记录）
         messages = []
         if history:
             messages.extend(history)
+
+        # 在历史之后、当前图像消息之前，插入指令消息
+        if instructions:
+            for inst in instructions:
+                messages.append({
+                    "role": "user",
+                    "content": USER_INSTRUCTION_MESSAGE.format(instruction=inst)
+                })
+
         messages.append({"role": "user", "content": content})
 
         response = self.client.messages.create(
@@ -257,13 +268,22 @@ class OpenAIBackend(LLMBackend):
         content.append({"type": "text", "text": ANALYSIS_REQUEST})
         return content
 
-    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "") -> str:
+    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "", instructions: Optional[List[str]] = None) -> str:
         content = self.build_image_content(images, time_info)
 
         # 构建消息列表（包含历史记录）
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
             messages.extend(history)
+
+        # 在历史之后、当前图像消息之前，插入指令消息
+        if instructions:
+            for inst in instructions:
+                messages.append({
+                    "role": "user",
+                    "content": USER_INSTRUCTION_MESSAGE.format(instruction=inst)
+                })
+
         messages.append({"role": "user", "content": content})
 
         response = self.client.chat.completions.create(
@@ -291,7 +311,7 @@ class GeminiBackend(LLMBackend):
             result = f"{time_info}|{result}"
         return result
 
-    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "") -> str:
+    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "", instructions: Optional[List[str]] = None) -> str:
         import PIL.Image
 
         model = self.genai.GenerativeModel(self.model)
@@ -315,6 +335,11 @@ class GeminiBackend(LLMBackend):
                 content = msg.get("content", "")
                 if isinstance(content, str):
                     content_parts.append(f"[{role}]: {content}\n")
+
+        # 添加指令消息
+        if instructions:
+            for inst in instructions:
+                content_parts.append(f"[user]: {USER_INSTRUCTION_MESSAGE.format(instruction=inst)}\n")
 
         # 添加时间戳信息（如果提供）
         if time_info:
@@ -377,13 +402,22 @@ class QwenVLBackend(LLMBackend):
         content.append({"type": "text", "text": ANALYSIS_REQUEST})
         return content
 
-    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "") -> str:
+    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "", instructions: Optional[List[str]] = None) -> str:
         content = self.build_image_content(images, time_info)
 
         # 构建消息列表（包含历史记录）
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
             messages.extend(history)
+
+        # 在历史之后、当前图像消息之前，插入指令消息
+        if instructions:
+            for inst in instructions:
+                messages.append({
+                    "role": "user",
+                    "content": USER_INSTRUCTION_MESSAGE.format(instruction=inst)
+                })
+
         messages.append({"role": "user", "content": content})
 
         response = self.client.chat.completions.create(
@@ -440,13 +474,22 @@ class DeepSeekBackend(LLMBackend):
         content.append({"type": "text", "text": ANALYSIS_REQUEST})
         return content
 
-    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "") -> str:
+    def call_api(self, images: CameraImages, history: Optional[List[Dict[str, Any]]] = None, time_info: str = "", instructions: Optional[List[str]] = None) -> str:
         content = self.build_image_content(images, time_info)
 
         # 构建消息列表（包含历史记录）
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
             messages.extend(history)
+
+        # 在历史之后、当前图像消息之前，插入指令消息
+        if instructions:
+            for inst in instructions:
+                messages.append({
+                    "role": "user",
+                    "content": USER_INSTRUCTION_MESSAGE.format(instruction=inst)
+                })
+
         messages.append({"role": "user", "content": content})
 
         response = self.client.chat.completions.create(

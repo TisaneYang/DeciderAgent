@@ -42,6 +42,9 @@ class DeciderAgent:
         # 使用deque实现滑动窗口
         self.conversation_history: deque = deque(maxlen=max_history_size * 2)  # *2因为每次包含user和assistant
 
+        # 待处理的用户指令队列
+        self.pending_instructions: List[str] = []
+
         # 记录上次请求的时间戳（用于计算时间间隔）
         self.last_timestamp: Optional[str] = None
 
@@ -138,11 +141,22 @@ class DeciderAgent:
                     # 助手响应或纯文本消息，直接保留
                     history.append(msg)
 
-        # 调用后端进行决策（传入时间信息）
-        result = self.backend.decide(images, history, time_info)
+        # 消费待处理指令
+        instructions = self.consume_instructions()
+
+        # 调用后端进行决策（传入时间信息和指令）
+        result = self.backend.decide(images, history, time_info, instructions)
 
         # 更新对话历史（如果启用记忆功能）
         if self.enable_memory:
+            # 先将指令消息加入历史（在图像消息之前）
+            from prompts import USER_INSTRUCTION_MESSAGE
+            for inst in instructions:
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": USER_INSTRUCTION_MESSAGE.format(instruction=inst)
+                })
+
             # 构建包含图像数据和时间戳的用户消息
             user_message_content = self.backend.build_image_content(images, time_info)
 
@@ -193,6 +207,24 @@ class DeciderAgent:
         """清空对话历史"""
         self.conversation_history.clear()
         self.last_timestamp = None
+
+    def add_instruction(self, instruction: str) -> None:
+        """添加用户自然语言指令"""
+        self.pending_instructions.append(instruction)
+
+    def get_pending_instructions(self) -> List[str]:
+        """获取待处理指令"""
+        return self.pending_instructions.copy()
+
+    def clear_instructions(self) -> None:
+        """清除所有待处理指令"""
+        self.pending_instructions.clear()
+
+    def consume_instructions(self) -> List[str]:
+        """获取并清空待处理指令（一次性消费）"""
+        instructions = self.pending_instructions.copy()
+        self.pending_instructions.clear()
+        return instructions
 
     def get_history_summary(self) -> Dict[str, Any]:
         """

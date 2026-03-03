@@ -49,3 +49,6 @@ CAMERA_LABELS = {
 
 # 请求分析的提示
 ANALYSIS_REQUEST = "\n请分析以上四张摄像头图像，给出驾驶决策。"
+
+# 用户指令消息模板（用于插入对话历史）
+USER_INSTRUCTION_MESSAGE = "在上次决策后，收到一条自然语言指令：{instruction}"
