@@ -5,7 +5,7 @@ HTTP服务：基于FastAPI的驾驶决策API服务
 
 import io
 import base64
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 import tempfile
 import os
@@ -25,6 +25,8 @@ class DecisionResponse(BaseModel):
     """决策响应模型"""
     decision: str = Field(..., description="驾驶决策指令")
     analysis: str = Field(..., description="场景分析结果")
+    task_update: Dict[str, Any] = Field(default_factory=dict, description="LLM返回的任务状态更新建议")
+    task_state: Dict[str, Any] = Field(default_factory=dict, description="服务端维护的当前任务状态")
     success: bool = Field(default=True, description="请求是否成功")
 
     class Config:
@@ -32,6 +34,8 @@ class DecisionResponse(BaseModel):
             "example": {
                 "decision": "Lane follow",
                 "analysis": "前方道路畅通，车道线清晰，建议保持车道行驶。",
+                "task_update": {},
+                "task_state": {},
                 "success": True
             }
         }
@@ -64,6 +68,86 @@ class Base64DecisionRequest(BaseModel):
                 "timestamp": "1707734562.134"
             }
         }
+
+
+class InstructionRequest(BaseModel):
+    """指令请求模型，兼容旧版纯文本和新版结构化任务消息。"""
+
+    instruction: Optional[str] = Field(None, description="自然语言指令（旧版兼容字段）")
+    advice: Optional[str] = Field(None, description="总体建议")
+    description: Optional[str] = Field(None, description="总体说明")
+    traffic_command: Optional[str] = Field(None, description="交通管理指令")
+    scene_type: Optional[str] = Field(None, description="场景类型")
+    risk_level: Optional[str] = Field(None, description="风险等级")
+    should_intervene: Optional[bool] = Field(None, description="是否建议干预")
+    tasks: List[Dict[str, Any]] = Field(default_factory=list, description="结构化任务列表")
+    plan: Dict[str, Any] = Field(default_factory=dict, description="总体规划")
+
+
+def extract_instructions_from_payload(request: InstructionRequest) -> List[str]:
+    """将结构化/instruction负载统一展开为待处理自然语言指令列表。"""
+    instructions: List[str] = []
+
+    if request.traffic_command:
+        instructions.append(f"交通管理指令：{request.traffic_command}")
+
+    if request.description:
+        instructions.append(f"总体说明：{request.description}")
+    elif request.advice:
+        instructions.append(f"总体建议：{request.advice}")
+    elif request.instruction:
+        instructions.append(request.instruction)
+
+    if request.scene_type or request.risk_level or request.should_intervene is not None:
+        state_parts = []
+        if request.scene_type:
+            state_parts.append(f"场景类型={request.scene_type}")
+        if request.risk_level:
+            state_parts.append(f"风险等级={request.risk_level}")
+        if request.should_intervene is not None:
+            state_parts.append(f"是否干预={request.should_intervene}")
+        instructions.append("环境状态：" + "，".join(state_parts))
+
+    if request.plan:
+        summary = request.plan.get("summary")
+        objective = request.plan.get("objective")
+        execution_mode = request.plan.get("execution_mode")
+        plan_parts = []
+        if summary:
+            plan_parts.append(f"摘要={summary}")
+        if objective:
+            plan_parts.append(f"目标={objective}")
+        if execution_mode:
+            plan_parts.append(f"模式={execution_mode}")
+        if plan_parts:
+            instructions.append("总体规划：" + "，".join(plan_parts))
+
+    for index, task in enumerate(request.tasks, start=1):
+        description = str(task.get("description", "")).strip()
+        time_limit = task.get("time_limit")
+        if not description:
+            continue
+        if time_limit is None:
+            instructions.append(f"任务{index}：{description}")
+        else:
+            instructions.append(f"任务{index}：{description}（时限 {time_limit}s）")
+
+    return [instruction for instruction in instructions if instruction.strip()]
+
+
+def build_task_payload(request: InstructionRequest) -> Dict[str, Any]:
+    """将HTTP请求转换为任务计划payload。"""
+    return {
+        "instruction": request.instruction,
+        "advice": request.advice,
+        "description": request.description,
+        "traffic_command": request.traffic_command,
+        "scene_type": request.scene_type,
+        "risk_level": request.risk_level,
+        "should_intervene": request.should_intervene,
+        "tasks": request.tasks,
+        "plan": request.plan,
+    }
 
 
 # 创建FastAPI应用
@@ -198,10 +282,14 @@ async def decide_from_upload(
         return DecisionResponse(
             decision=result.decision,
             analysis=result.analysis,
+            task_update=result.task_update,
+            task_state=agent.get_task_plan_state(),
             success=True
         )
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"决策分析失败: {str(e)}")
 
     finally:
@@ -252,12 +340,16 @@ async def decide_from_base64(request: Base64DecisionRequest):
         return DecisionResponse(
             decision=result.decision,
             analysis=result.analysis,
+            task_update=result.task_update,
+            task_state=agent.get_task_plan_state(),
             success=True
         )
 
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"决策分析失败: {str(e)}")
 
     finally:
@@ -299,6 +391,55 @@ async def get_valid_decisions():
         "valid_decisions": VALID_DECISIONS,
         "count": len(VALID_DECISIONS)
     }
+
+
+@app.post("/instruct", tags=["指令"])
+async def add_instruction(request: InstructionRequest):
+    """添加自然语言指令或结构化任务（覆盖式刷新任务列表）"""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent未初始化")
+
+    task_payload = build_task_payload(request)
+    instructions = extract_instructions_from_payload(request)
+    if not instructions and not request.tasks:
+        raise HTTPException(status_code=400, detail="请求中未包含可用的指令或任务信息")
+
+    task_state = agent.replace_task_plan(task_payload)
+    task_count = len(task_state.get("tasks", []))
+
+    return {
+        "success": True,
+        "mode": "replace",
+        "instruction": instructions[0] if instructions else "",
+        "instructions": instructions,
+        "added_count": len(instructions),
+        "task_count": task_count,
+        "task_state": task_state
+    }
+
+
+@app.get("/instruct", tags=["指令"])
+async def get_instructions():
+    """获取待处理指令和当前任务计划状态"""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent未初始化")
+
+    task_state = agent.get_task_plan_state()
+    return {
+        "instructions": agent.get_pending_instructions(),
+        "count": len(agent.get_pending_instructions()),
+        "task_state": task_state
+    }
+
+
+@app.delete("/instruct", tags=["指令"])
+async def clear_instructions():
+    """清除所有待处理指令和任务计划"""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent未初始化")
+
+    agent.clear_instructions()
+    return {"success": True, "message": "所有指令与任务计划已清除"}
 
 
 def start_server(

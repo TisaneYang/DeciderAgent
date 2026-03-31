@@ -5,7 +5,9 @@ DeciderAgent: 基于多模态LLM的驾驶决策Agent
 
 from typing import Optional, List, Dict, Any
 from collections import deque
-from datetime import datetime
+import copy
+import time
+import uuid
 
 from backends import CameraImages, DecisionResult, LLMBackend, create_backend
 from config import DEFAULT_BACKEND, API_KEYS, DEFAULT_MODELS, MAX_HISTORY_SIZE, ENABLE_MEMORY, MAX_IMAGE_HISTORY
@@ -41,6 +43,13 @@ class DeciderAgent:
 
         # 使用deque实现滑动窗口
         self.conversation_history: deque = deque(maxlen=max_history_size * 2)  # *2因为每次包含user和assistant
+
+        # 待处理的用户指令队列
+        self.pending_instructions: List[str] = []
+
+        # 任务执行状态（由代码维护，LLM每轮只输出状态更新建议）
+        self.plan_version: int = 0
+        self.active_task_plan: Dict[str, Any] = self._empty_task_plan()
 
         # 记录上次请求的时间戳（用于计算时间间隔）
         self.last_timestamp: Optional[str] = None
@@ -138,11 +147,28 @@ class DeciderAgent:
                     # 助手响应或纯文本消息，直接保留
                     history.append(msg)
 
-        # 调用后端进行决策（传入时间信息）
-        result = self.backend.decide(images, history, time_info)
+        # 构建当前任务上下文指令，并消费待处理指令
+        instructions = self.consume_instructions()
+        task_context = self.build_task_context_instruction()
+        if task_context:
+            instructions.insert(0, task_context)
+
+        # 调用后端进行决策（传入时间信息和指令）
+        result = self.backend.decide(images, history, time_info, instructions)
+
+        # 根据LLM输出尝试更新任务状态
+        self.apply_task_update(result.task_update)
 
         # 更新对话历史（如果启用记忆功能）
         if self.enable_memory:
+            # 先将指令消息加入历史（在图像消息之前）
+            from prompts import USER_INSTRUCTION_MESSAGE
+            for inst in instructions:
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": USER_INSTRUCTION_MESSAGE.format(instruction=inst)
+                })
+
             # 构建包含图像数据和时间戳的用户消息
             user_message_content = self.backend.build_image_content(images, time_info)
 
@@ -194,6 +220,206 @@ class DeciderAgent:
         self.conversation_history.clear()
         self.last_timestamp = None
 
+    def add_instruction(self, instruction: str) -> None:
+        """添加用户自然语言指令（兼容接口：会重置任务列表为单任务）。"""
+        self.replace_task_plan({
+            "instruction": instruction,
+            "tasks": [{"description": instruction, "time_limit": 15}],
+            "plan": {"summary": instruction, "execution_mode": "manual_instruction"},
+        })
+
+    def get_pending_instructions(self) -> List[str]:
+        """获取待处理指令（兼容接口）"""
+        return self.pending_instructions.copy()
+
+    def clear_instructions(self) -> None:
+        """清除所有待处理指令和任务计划"""
+        self.pending_instructions.clear()
+        self.active_task_plan = self._empty_task_plan()
+
+    def consume_instructions(self) -> List[str]:
+        """获取并清空待处理指令（一次性消费）"""
+        instructions = self.pending_instructions.copy()
+        self.pending_instructions.clear()
+        return instructions
+
+    def _empty_task_plan(self) -> Dict[str, Any]:
+        """返回空任务计划。"""
+        return {
+            "plan_id": "",
+            "plan_version": self.plan_version,
+            "scene_type": None,
+            "risk_level": None,
+            "should_intervene": None,
+            "traffic_command": None,
+            "plan": {},
+            "tasks": [],
+            "current_task_index": 0,
+            "global_status": "idle",
+            "updated_at": None,
+        }
+
+    def replace_task_plan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """覆盖式刷新任务列表（新指令到达时替换，不追加）。"""
+        self.plan_version += 1
+        now_ts = time.time()
+
+        source_tasks = payload.get("tasks") or []
+        if not source_tasks:
+            instruction = (
+                payload.get("instruction")
+                or payload.get("description")
+                or payload.get("advice")
+                or payload.get("traffic_command")
+            )
+            if instruction:
+                source_tasks = [{"description": instruction, "time_limit": 15}]
+
+        tasks: List[Dict[str, Any]] = []
+        for index, task in enumerate(source_tasks):
+            description = str(task.get("description", "")).strip()
+            if not description:
+                continue
+            try:
+                time_limit = max(1, int(task.get("time_limit", 15)))
+            except (TypeError, ValueError):
+                time_limit = 15
+            tasks.append({
+                "task_id": f"t{index + 1}",
+                "description": description,
+                "time_limit": time_limit,
+                "status": "pending",
+                "start_ts": None,
+                "elapsed": 0.0,
+                "progress_score": 0.0,
+                "completion_confidence": 0.0,
+                "completion_reason": "",
+                "evidence": [],
+            })
+
+        if tasks:
+            tasks[0]["status"] = "running"
+            tasks[0]["start_ts"] = now_ts
+
+        self.active_task_plan = {
+            "plan_id": payload.get("plan_id") or f"plan_{uuid.uuid4().hex[:8]}",
+            "plan_version": self.plan_version,
+            "scene_type": payload.get("scene_type"),
+            "risk_level": payload.get("risk_level"),
+            "should_intervene": payload.get("should_intervene"),
+            "traffic_command": payload.get("traffic_command"),
+            "plan": payload.get("plan", {}),
+            "tasks": tasks,
+            "current_task_index": 0,
+            "global_status": "running" if tasks else "idle",
+            "updated_at": now_ts,
+        }
+
+        # 新计划到达后，历史文本队列清空，避免旧上下文污染。
+        self.pending_instructions.clear()
+        return self.get_task_plan_state()
+
+    def get_task_plan_state(self) -> Dict[str, Any]:
+        """获取任务计划状态快照。"""
+        plan = copy.deepcopy(self.active_task_plan)
+        tasks = plan.get("tasks", [])
+        idx = plan.get("current_task_index", 0)
+        if tasks and 0 <= idx < len(tasks):
+            plan["current_task"] = copy.deepcopy(tasks[idx])
+        else:
+            plan["current_task"] = None
+        return plan
+
+    def build_task_context_instruction(self) -> str:
+        """构建当前任务上下文（每轮注入LLM）。"""
+        state = self.get_task_plan_state()
+        tasks = state.get("tasks", [])
+        if not tasks:
+            return ""
+
+        current = state.get("current_task")
+        if current and current.get("start_ts"):
+            current["elapsed"] = max(0.0, time.time() - float(current["start_ts"]))
+        remaining = [
+            f"{task['task_id']}:{task['description']}"
+            for task in tasks[state["current_task_index"] + 1:]
+        ]
+        completed = [
+            f"{task['task_id']}:{task['description']}"
+            for task in tasks
+            if task.get("status") == "done"
+        ]
+
+        return (
+            "当前任务计划上下文："
+            f"plan_version={state.get('plan_version')}；"
+            f"current_task={current.get('task_id') if current else 'none'}；"
+            f"current_description={current.get('description') if current else 'none'}；"
+            f"current_status={current.get('status') if current else 'none'}；"
+            f"current_elapsed={current.get('elapsed') if current else 0:.2f}s；"
+            f"current_time_limit={current.get('time_limit') if current else 0}s；"
+            f"completed={completed if completed else 'none'}；"
+            f"remaining={remaining if remaining else 'none'}。"
+            "请严格输出task_update字段，且只包含status/reason/confidence/progress_score。"
+        )
+
+    def apply_task_update(self, task_update: Optional[Dict[str, Any]]) -> None:
+        """应用LLM返回的任务状态更新。"""
+        if not task_update:
+            return
+
+        tasks = self.active_task_plan.get("tasks", [])
+        idx = self.active_task_plan.get("current_task_index", 0)
+        if not tasks or idx >= len(tasks):
+            return
+
+        current_task = tasks[idx]
+        now_ts = time.time()
+        if current_task.get("start_ts") is None:
+            current_task["start_ts"] = now_ts
+        current_task["elapsed"] = max(0.0, now_ts - float(current_task.get("start_ts") or now_ts))
+
+        def _safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        status = str(task_update.get("status", "")).strip().lower()
+        confidence = _safe_float(task_update.get("confidence", 0.0), 0.0)
+        progress_score = _safe_float(task_update.get("progress_score", 0.0), 0.0)
+        reason = str(task_update.get("reason", "")).strip()
+
+        if reason:
+            current_task["completion_reason"] = reason
+        current_task["completion_confidence"] = max(0.0, min(1.0, confidence))
+        current_task["progress_score"] = max(0.0, min(1.0, progress_score))
+
+        if status in {"running", "pending", "done", "blocked", "failed", "timeout"}:
+            current_task["status"] = status
+        elif current_task.get("status") == "pending":
+            current_task["status"] = "running"
+
+        # 后端根据status自行推进：仅当当前任务done时进入下一任务。
+        advance_to_next = current_task.get("status") == "done"
+        if advance_to_next and idx < len(tasks) - 1:
+            self.active_task_plan["current_task_index"] = idx + 1
+            next_task = tasks[idx + 1]
+            if next_task.get("status") == "pending":
+                next_task["status"] = "running"
+                next_task["start_ts"] = now_ts
+                next_task["elapsed"] = 0.0
+        elif advance_to_next and idx == len(tasks) - 1:
+            self.active_task_plan["global_status"] = "completed"
+
+        # 如果所有任务都完成，则全局完成。
+        if tasks and all(task.get("status") == "done" for task in tasks):
+            self.active_task_plan["global_status"] = "completed"
+        elif tasks:
+            self.active_task_plan["global_status"] = "running"
+
+        self.active_task_plan["updated_at"] = now_ts
+
     def get_history_summary(self) -> Dict[str, Any]:
         """
         获取历史记录摘要
@@ -222,6 +448,7 @@ class DeciderAgent:
             "max_image_history": self.max_image_history,
             "image_rounds_stored": image_rounds,
             "memory_enabled": self.enable_memory,
+            "task_plan": self.get_task_plan_state(),
             "history": list(self.conversation_history)
         }
 
