@@ -4,7 +4,7 @@
 # 默认配置
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-BACKEND="${DECIDER_BACKEND:-anthropic}"
+BACKEND="${DECIDER_BACKEND:-qwen}"
 MODEL="${DECIDER_MODEL:-}"
 RELOAD="${RELOAD:-false}"
 

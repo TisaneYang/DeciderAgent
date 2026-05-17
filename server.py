@@ -24,16 +24,20 @@ from config import VALID_DECISIONS, DEFAULT_BACKEND, DEFAULT_MODELS
 class DecisionResponse(BaseModel):
     """决策响应模型"""
     decision: str = Field(..., description="驾驶决策指令")
+    control_override: Optional[str] = Field(None, description="控制覆盖指令，如 full_brake")
     analysis: str = Field(..., description="场景分析结果")
+    intention_nl: str = Field("", description="Agent输出的自然语言意图（含请求来源与任务进度）")
     task_update: Dict[str, Any] = Field(default_factory=dict, description="LLM返回的任务状态更新建议")
-    task_state: Dict[str, Any] = Field(default_factory=dict, description="服务端维护的当前任务状态")
+    task_state: Dict[str, Any] = Field(default_factory=dict, description="服务端维护的轻量任务上下文状态")
     success: bool = Field(default=True, description="请求是否成功")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "decision": "Lane follow",
+                "control_override": None,
                 "analysis": "前方道路畅通，车道线清晰，建议保持车道行驶。",
+                "intention_nl": "当前驾驶意图：保持车道行驶；本轮请求来源：执行当前巡航任务；前一组任务完成情况：已完成1/2，剩余任务进行中。",
                 "task_update": {},
                 "task_state": {},
                 "success": True
@@ -57,6 +61,7 @@ class Base64DecisionRequest(BaseModel):
     right_image: str = Field(..., description="右侧摄像头图像(base64编码)")
     rear_image: str = Field(..., description="后置摄像头图像(base64编码)")
     timestamp: Optional[str] = Field(None, description="客户端提供的Unix时间戳字符串（秒）")
+    allowed_decisions: Optional[List[str]] = Field(None, description="本轮允许的决策集合（可选）")
 
     class Config:
         json_schema_extra = {
@@ -70,69 +75,65 @@ class Base64DecisionRequest(BaseModel):
         }
 
 
-class InstructionRequest(BaseModel):
-    """指令请求模型，兼容旧版纯文本和新版结构化任务消息。"""
+from typing import List, Dict, Any, Optional
 
-    instruction: Optional[str] = Field(None, description="自然语言指令（旧版兼容字段）")
+# --- 子模型定义 ---
+
+class CameraCoverage(BaseModel):
+    """摄像头覆盖范围详情"""
+    in_blind_spot: bool = Field(True, description="是否处于盲区")
+    visible_cameras: List[str] = Field(default_factory=list, description="可见摄像头列表")
+    blind_spot_info: Optional[Any] = Field(None, description="盲区详细信息")
+
+class ManeuverAction(BaseModel):
+    """单步机动动作描述"""
+    step: int = Field(..., description="步骤序号")
+    action: str = Field(..., description="动作类型，如 change_lane_left, go_straight")
+    description: str = Field(..., description="动作的详细描述")
+
+class ManeuverSequence(BaseModel):
+    """机动动作序列及其决策理由"""
+    reasoning: str = Field("", description="决策推理过程")
+    action_sequence: List[ManeuverAction] = Field(default_factory=list, description="具体的动作步骤列表")
+
+# --- 主模型定义 ---
+
+class InstructionRequest(BaseModel):
+    """指令请求模型，支持旧版兼容、摄像头监控及结构化机动规划。"""
+
+    # 1. 基础信息与旧版兼容
+    instruction: Optional[str] = Field(None, description="自然语言指令（旧版兼容）")
     advice: Optional[str] = Field(None, description="总体建议")
     description: Optional[str] = Field(None, description="总体说明")
-    traffic_command: Optional[str] = Field(None, description="交通管理指令")
+    # traffic_command: Optional[str] = Field(None, description="交通管理指令")
     scene_type: Optional[str] = Field(None, description="场景类型")
-    risk_level: Optional[str] = Field(None, description="风险等级")
-    should_intervene: Optional[bool] = Field(None, description="是否建议干预")
+    
+    # 2. 状态与评估
+    risk_level: str = Field("medium", description="风险等级")
+    should_intervene: bool = Field(False, description="是否建议干预")
+    confidence: float = Field(0.0, description="置信度")
+    
+    # 3. 摄像头与感知
+    camera_coverage: Optional[CameraCoverage] = Field(None, description="摄像头覆盖情况")
+    
+    # 4. 决策与规划 (重点完善部分)
+    maneuver_sequence: Optional[ManeuverSequence] = Field(None, description="机动动作序列详情")
+    validation_result: Dict[str, Any] = Field(default_factory=dict, description="验证结果")
+    
+    # 5. 任务列表与总体规划
     tasks: List[Dict[str, Any]] = Field(default_factory=list, description="结构化任务列表")
-    plan: Dict[str, Any] = Field(default_factory=dict, description="总体规划")
+    plan: Any = Field(default_factory=dict, description="总体规划（可包含mermaid/topology等字段）")
 
 
 def extract_instructions_from_payload(request: InstructionRequest) -> List[str]:
-    """将结构化/instruction负载统一展开为待处理自然语言指令列表。"""
-    instructions: List[str] = []
-
-    if request.traffic_command:
-        instructions.append(f"交通管理指令：{request.traffic_command}")
-
-    if request.description:
-        instructions.append(f"总体说明：{request.description}")
-    elif request.advice:
-        instructions.append(f"总体建议：{request.advice}")
-    elif request.instruction:
-        instructions.append(request.instruction)
-
-    if request.scene_type or request.risk_level or request.should_intervene is not None:
-        state_parts = []
-        if request.scene_type:
-            state_parts.append(f"场景类型={request.scene_type}")
-        if request.risk_level:
-            state_parts.append(f"风险等级={request.risk_level}")
-        if request.should_intervene is not None:
-            state_parts.append(f"是否干预={request.should_intervene}")
-        instructions.append("环境状态：" + "，".join(state_parts))
-
-    if request.plan:
-        summary = request.plan.get("summary")
-        objective = request.plan.get("objective")
-        execution_mode = request.plan.get("execution_mode")
-        plan_parts = []
-        if summary:
-            plan_parts.append(f"摘要={summary}")
-        if objective:
-            plan_parts.append(f"目标={objective}")
-        if execution_mode:
-            plan_parts.append(f"模式={execution_mode}")
-        if plan_parts:
-            instructions.append("总体规划：" + "，".join(plan_parts))
-
-    for index, task in enumerate(request.tasks, start=1):
-        description = str(task.get("description", "")).strip()
-        time_limit = task.get("time_limit")
-        if not description:
-            continue
-        if time_limit is None:
-            instructions.append(f"任务{index}：{description}")
-        else:
-            instructions.append(f"任务{index}：{description}（时限 {time_limit}s）")
-
-    return [instruction for instruction in instructions if instruction.strip()]
+    """仅提取plan中的mermaid字符串。"""
+    if not isinstance(request.plan, dict):
+        return []
+    mermaid = request.plan.get("mermaid")
+    if not isinstance(mermaid, str):
+        return []
+    text = mermaid.strip()
+    return [text] if text else []
 
 
 def build_task_payload(request: InstructionRequest) -> Dict[str, Any]:
@@ -141,7 +142,7 @@ def build_task_payload(request: InstructionRequest) -> Dict[str, Any]:
         "instruction": request.instruction,
         "advice": request.advice,
         "description": request.description,
-        "traffic_command": request.traffic_command,
+        # "traffic_command": request.traffic_command,
         "scene_type": request.scene_type,
         "risk_level": request.risk_level,
         "should_intervene": request.should_intervene,
@@ -249,7 +250,8 @@ async def decide_from_upload(
     left: UploadFile = File(..., description="左侧摄像头图像"),
     right: UploadFile = File(..., description="右侧摄像头图像"),
     rear: UploadFile = File(..., description="后置摄像头图像"),
-    timestamp: Optional[str] = Form(None, description="客户端提供的Unix时间戳字符串（秒）")
+    timestamp: Optional[str] = Form(None, description="客户端提供的Unix时间戳字符串（秒）"),
+    allowed_decisions: Optional[str] = Form(None, description="本轮允许的决策集合(JSON字符串)")
 ):
     """
     通过上传文件进行决策分析
@@ -271,17 +273,30 @@ async def decide_from_upload(
         temp_files = [front_path, left_path, right_path, rear_path]
 
         # 执行决策
+        parsed_allowed_decisions = None
+        if allowed_decisions:
+            try:
+                import json
+                parsed = json.loads(allowed_decisions)
+                if isinstance(parsed, list):
+                    parsed_allowed_decisions = [str(item) for item in parsed]
+            except Exception:
+                parsed_allowed_decisions = None
+
         result = agent.decide_from_paths(
             front_path=front_path,
             left_path=left_path,
             right_path=right_path,
             rear_path=rear_path,
-            timestamp=timestamp
+            timestamp=timestamp,
+            allowed_decisions=parsed_allowed_decisions
         )
 
         return DecisionResponse(
             decision=result.decision,
+            control_override=result.parsed_response.get("control_override"),
             analysis=result.analysis,
+            intention_nl=result.intention_nl,
             task_update=result.task_update,
             task_state=agent.get_task_plan_state(),
             success=True
@@ -334,12 +349,15 @@ async def decide_from_base64(request: Base64DecisionRequest):
             left_path=left_path,
             right_path=right_path,
             rear_path=rear_path,
-            timestamp=request.timestamp
+            timestamp=request.timestamp,
+            allowed_decisions=request.allowed_decisions
         )
 
         return DecisionResponse(
             decision=result.decision,
+            control_override=result.parsed_response.get("control_override"),
             analysis=result.analysis,
+            intention_nl=result.intention_nl,
             task_update=result.task_update,
             task_state=agent.get_task_plan_state(),
             success=True
@@ -395,17 +413,19 @@ async def get_valid_decisions():
 
 @app.post("/instruct", tags=["指令"])
 async def add_instruction(request: InstructionRequest):
-    """添加自然语言指令或结构化任务（覆盖式刷新任务列表）"""
+    """仅接收plan.mermaid并覆盖刷新任务上下文。"""
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent未初始化")
 
-    task_payload = build_task_payload(request)
     instructions = extract_instructions_from_payload(request)
-    if not instructions and not request.tasks:
-        raise HTTPException(status_code=400, detail="请求中未包含可用的指令或任务信息")
+    if not instructions:
+        raise HTTPException(status_code=404, detail="未找到有效的plan.mermaid字符串")
+
+    task_payload = {
+        "plan": {"mermaid": instructions[0]}
+    }
 
     task_state = agent.replace_task_plan(task_payload)
-    task_count = len(task_state.get("tasks", []))
 
     return {
         "success": True,
@@ -413,7 +433,6 @@ async def add_instruction(request: InstructionRequest):
         "instruction": instructions[0] if instructions else "",
         "instructions": instructions,
         "added_count": len(instructions),
-        "task_count": task_count,
         "task_state": task_state
     }
 

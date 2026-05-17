@@ -5,12 +5,10 @@ DeciderAgent: 基于多模态LLM的驾驶决策Agent
 
 from typing import Optional, List, Dict, Any
 from collections import deque
-import copy
 import time
-import uuid
 
 from backends import CameraImages, DecisionResult, LLMBackend, create_backend
-from config import DEFAULT_BACKEND, API_KEYS, DEFAULT_MODELS, MAX_HISTORY_SIZE, ENABLE_MEMORY, MAX_IMAGE_HISTORY
+from config import DEFAULT_BACKEND, API_KEYS, DEFAULT_MODELS, MAX_HISTORY_SIZE, ENABLE_MEMORY, MAX_IMAGE_HISTORY, VALID_DECISIONS
 
 
 class DeciderAgent:
@@ -47,9 +45,12 @@ class DeciderAgent:
         # 待处理的用户指令队列
         self.pending_instructions: List[str] = []
 
-        # 任务执行状态（由代码维护，LLM每轮只输出状态更新建议）
-        self.plan_version: int = 0
-        self.active_task_plan: Dict[str, Any] = self._empty_task_plan()
+        # 持久化的上游任务拓扑上下文（仅用于每轮注入，不做状态机维护）
+        self.current_mermaid: str = ""
+        self.task_context_meta: Dict[str, Any] = {
+            "updated_at": None,
+            "source": "none",
+        }
 
         # 记录上次请求的时间戳（用于计算时间间隔）
         self.last_timestamp: Optional[str] = None
@@ -71,6 +72,20 @@ class DeciderAgent:
         )
 
         self.model = model or DEFAULT_MODELS[backend_type]
+
+    @staticmethod
+    def _build_allowed_decisions_instruction(allowed_decisions: Optional[List[str]]) -> str:
+        """构造本轮决策硬约束文本。"""
+        if not allowed_decisions:
+            return ""
+        valid_allowed = [d for d in allowed_decisions if d in VALID_DECISIONS]
+        if not valid_allowed:
+            return ""
+        joined = ", ".join(f'"{d}"' for d in valid_allowed)
+        return (
+            "本轮决策硬约束：allowed_decisions = "
+            f"[{joined}]。你必须且只能从该集合中选择decision。"
+        )
 
     def decide(self, images: CameraImages) -> DecisionResult:
         """
@@ -156,8 +171,12 @@ class DeciderAgent:
         # 调用后端进行决策（传入时间信息和指令）
         result = self.backend.decide(images, history, time_info, instructions)
 
-        # 根据LLM输出尝试更新任务状态
-        self.apply_task_update(result.task_update)
+        # 要求LLM单独输出自然语言意图字段；若缺失则做保底生成，避免下游出现空值。
+        intention_nl = str(result.parsed_response.get("intention_nl", "")).strip()
+        if not intention_nl:
+            intention_nl = self._build_fallback_intention_nl(decision=result.decision)
+        result.intention_nl = intention_nl
+        result.parsed_response["intention_nl"] = intention_nl
 
         # 更新对话历史（如果启用记忆功能）
         if self.enable_memory:
@@ -185,13 +204,38 @@ class DeciderAgent:
 
         return result
 
+    def decide_with_constraints(
+        self,
+        images: CameraImages,
+        allowed_decisions: Optional[List[str]] = None
+    ) -> DecisionResult:
+        """
+        根据四个摄像头图像做出驾驶决策（带本轮动作约束）。
+
+        Args:
+            images: 四个摄像头的图像
+            allowed_decisions: 本轮允许的决策集合（可选）
+
+        Returns:
+            DecisionResult
+        """
+        if not allowed_decisions:
+            return self.decide(images)
+
+        allowed_instruction = self._build_allowed_decisions_instruction(allowed_decisions)
+        if allowed_instruction:
+            self.pending_instructions.insert(0, allowed_instruction)
+
+        return self.decide(images)
+
     def decide_from_paths(
         self,
         front_path: str,
         left_path: str,
         right_path: str,
         rear_path: str,
-        timestamp: Optional[str] = None
+        timestamp: Optional[str] = None,
+        allowed_decisions: Optional[List[str]] = None
     ) -> DecisionResult:
         """
         便捷方法：直接传入四个图像路径
@@ -202,6 +246,7 @@ class DeciderAgent:
             right_path: 右侧摄像头图像路径
             rear_path: 后置摄像头图像路径
             timestamp: 客户端提供的时间戳（可选）
+            allowed_decisions: 本轮允许的决策集合（可选）
 
         Returns:
             DecisionResult: 包含analysis, decision, raw_response
@@ -213,7 +258,7 @@ class DeciderAgent:
             rear=rear_path,
             timestamp=timestamp
         )
-        return self.decide(images)
+        return self.decide_with_constraints(images, allowed_decisions)
 
     def clear_history(self):
         """清空对话历史"""
@@ -221,10 +266,9 @@ class DeciderAgent:
         self.last_timestamp = None
 
     def add_instruction(self, instruction: str) -> None:
-        """添加用户自然语言指令（兼容接口：会重置任务列表为单任务）。"""
+        """添加用户自然语言指令（兼容接口：覆盖当前mermaid上下文）。"""
         self.replace_task_plan({
             "instruction": instruction,
-            "tasks": [{"description": instruction, "time_limit": 15}],
             "plan": {"summary": instruction, "execution_mode": "manual_instruction"},
         })
 
@@ -233,9 +277,10 @@ class DeciderAgent:
         return self.pending_instructions.copy()
 
     def clear_instructions(self) -> None:
-        """清除所有待处理指令和任务计划"""
+        """清除待处理指令与当前任务拓扑上下文。"""
         self.pending_instructions.clear()
-        self.active_task_plan = self._empty_task_plan()
+        self.current_mermaid = ""
+        self.task_context_meta = {"updated_at": None, "source": "none"}
 
     def consume_instructions(self) -> List[str]:
         """获取并清空待处理指令（一次性消费）"""
@@ -243,182 +288,78 @@ class DeciderAgent:
         self.pending_instructions.clear()
         return instructions
 
-    def _empty_task_plan(self) -> Dict[str, Any]:
-        """返回空任务计划。"""
-        return {
-            "plan_id": "",
-            "plan_version": self.plan_version,
-            "scene_type": None,
-            "risk_level": None,
-            "should_intervene": None,
-            "traffic_command": None,
-            "plan": {},
-            "tasks": [],
-            "current_task_index": 0,
-            "global_status": "idle",
-            "updated_at": None,
-        }
+    @staticmethod
+    def _extract_task_topology(payload: Dict[str, Any]) -> str:
+        """提取上游任务拓扑文本（优先mermaid原文，其次结构化任务清单）。"""
+        plan = payload.get("plan")
+        candidates: List[Any] = []
+        if isinstance(plan, dict):
+            candidates.extend([
+                plan.get("mermaid"),
+                plan.get("topology"),
+                plan.get("task_topology"),
+                plan.get("graph"),
+                plan.get("raw"),
+            ])
+        elif isinstance(plan, str):
+            candidates.append(plan)
+
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text:
+                return text
+
+        # 若上游未提供mermaid原文，使用结构化任务生成稳定文本
+        source_tasks = payload.get("tasks") or []
+        lines = []
+        for index, task in enumerate(source_tasks, start=1):
+            task_id = str(task.get("task_id", f"t{index}")).strip()
+            desc = str(task.get("description", "")).strip()
+            if not desc:
+                continue
+            lines.append(f"{task_id}:{desc}")
+        return " -> ".join(lines)
 
     def replace_task_plan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """覆盖式刷新任务列表（新指令到达时替换，不追加）。"""
-        self.plan_version += 1
-        now_ts = time.time()
-
-        source_tasks = payload.get("tasks") or []
-        if not source_tasks:
-            instruction = (
-                payload.get("instruction")
-                or payload.get("description")
-                or payload.get("advice")
-                or payload.get("traffic_command")
-            )
-            if instruction:
-                source_tasks = [{"description": instruction, "time_limit": 15}]
-
-        tasks: List[Dict[str, Any]] = []
-        for index, task in enumerate(source_tasks):
-            description = str(task.get("description", "")).strip()
-            if not description:
-                continue
-            try:
-                time_limit = max(1, int(task.get("time_limit", 15)))
-            except (TypeError, ValueError):
-                time_limit = 15
-            tasks.append({
-                "task_id": f"t{index + 1}",
-                "description": description,
-                "time_limit": time_limit,
-                "status": "pending",
-                "start_ts": None,
-                "elapsed": 0.0,
-                "progress_score": 0.0,
-                "completion_confidence": 0.0,
-                "completion_reason": "",
-                "evidence": [],
-            })
-
-        if tasks:
-            tasks[0]["status"] = "running"
-            tasks[0]["start_ts"] = now_ts
-
-        self.active_task_plan = {
-            "plan_id": payload.get("plan_id") or f"plan_{uuid.uuid4().hex[:8]}",
-            "plan_version": self.plan_version,
-            "scene_type": payload.get("scene_type"),
-            "risk_level": payload.get("risk_level"),
-            "should_intervene": payload.get("should_intervene"),
-            "traffic_command": payload.get("traffic_command"),
-            "plan": payload.get("plan", {}),
-            "tasks": tasks,
-            "current_task_index": 0,
-            "global_status": "running" if tasks else "idle",
-            "updated_at": now_ts,
+        """覆盖式刷新任务上下文（仅保留mermaid/任务文本，不做状态迁移）。"""
+        mermaid = self._extract_task_topology(payload)
+        self.current_mermaid = mermaid
+        self.task_context_meta = {
+            "updated_at": time.time(),
+            "source": "instruct",
         }
 
-        # 新计划到达后，历史文本队列清空，避免旧上下文污染。
+        # 新任务上下文到达后，清空待处理指令，避免旧指令污染。
         self.pending_instructions.clear()
         return self.get_task_plan_state()
 
     def get_task_plan_state(self) -> Dict[str, Any]:
-        """获取任务计划状态快照。"""
-        plan = copy.deepcopy(self.active_task_plan)
-        tasks = plan.get("tasks", [])
-        idx = plan.get("current_task_index", 0)
-        if tasks and 0 <= idx < len(tasks):
-            plan["current_task"] = copy.deepcopy(tasks[idx])
-        else:
-            plan["current_task"] = None
-        return plan
+        """获取当前任务上下文状态快照（轻量）。"""
+        return {
+            "mermaid_context": self.current_mermaid,
+            "has_mermaid_context": bool(self.current_mermaid.strip()),
+            "updated_at": self.task_context_meta.get("updated_at"),
+            "source": self.task_context_meta.get("source", "none"),
+        }
 
     def build_task_context_instruction(self) -> str:
-        """构建当前任务上下文（每轮注入LLM）。"""
-        state = self.get_task_plan_state()
-        tasks = state.get("tasks", [])
-        if not tasks:
+        """构建当前任务上下文（每轮注入LLM，仅用于推理参考）。"""
+        mermaid = self.current_mermaid.strip()
+        if not mermaid:
             return ""
 
-        current = state.get("current_task")
-        if current and current.get("start_ts"):
-            current["elapsed"] = max(0.0, time.time() - float(current["start_ts"]))
-        remaining = [
-            f"{task['task_id']}:{task['description']}"
-            for task in tasks[state["current_task_index"] + 1:]
-        ]
-        completed = [
-            f"{task['task_id']}:{task['description']}"
-            for task in tasks
-            if task.get("status") == "done"
-        ]
-
         return (
-            "当前任务计划上下文："
-            f"plan_version={state.get('plan_version')}；"
-            f"current_task={current.get('task_id') if current else 'none'}；"
-            f"current_description={current.get('description') if current else 'none'}；"
-            f"current_status={current.get('status') if current else 'none'}；"
-            f"current_elapsed={current.get('elapsed') if current else 0:.2f}s；"
-            f"current_time_limit={current.get('time_limit') if current else 0}s；"
-            f"completed={completed if completed else 'none'}；"
-            f"remaining={remaining if remaining else 'none'}。"
+            "当前上游任务拓扑（仅供参考，不是代码侧状态机）："
+            f"{mermaid}。"
+            "task_update字段仅作为本轮推理说明，不作为系统真实状态源。"
             "请严格输出task_update字段，且只包含status/reason/confidence/progress_score。"
+            "请额外输出intention_nl字段，内容必须包含：当前驾驶意图、本轮请求来源。"
         )
 
-    def apply_task_update(self, task_update: Optional[Dict[str, Any]]) -> None:
-        """应用LLM返回的任务状态更新。"""
-        if not task_update:
-            return
-
-        tasks = self.active_task_plan.get("tasks", [])
-        idx = self.active_task_plan.get("current_task_index", 0)
-        if not tasks or idx >= len(tasks):
-            return
-
-        current_task = tasks[idx]
-        now_ts = time.time()
-        if current_task.get("start_ts") is None:
-            current_task["start_ts"] = now_ts
-        current_task["elapsed"] = max(0.0, now_ts - float(current_task.get("start_ts") or now_ts))
-
-        def _safe_float(value: Any, default: float = 0.0) -> float:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return default
-
-        status = str(task_update.get("status", "")).strip().lower()
-        confidence = _safe_float(task_update.get("confidence", 0.0), 0.0)
-        progress_score = _safe_float(task_update.get("progress_score", 0.0), 0.0)
-        reason = str(task_update.get("reason", "")).strip()
-
-        if reason:
-            current_task["completion_reason"] = reason
-        current_task["completion_confidence"] = max(0.0, min(1.0, confidence))
-        current_task["progress_score"] = max(0.0, min(1.0, progress_score))
-
-        if status in {"running", "pending", "done", "blocked", "failed", "timeout"}:
-            current_task["status"] = status
-        elif current_task.get("status") == "pending":
-            current_task["status"] = "running"
-
-        # 后端根据status自行推进：仅当当前任务done时进入下一任务。
-        advance_to_next = current_task.get("status") == "done"
-        if advance_to_next and idx < len(tasks) - 1:
-            self.active_task_plan["current_task_index"] = idx + 1
-            next_task = tasks[idx + 1]
-            if next_task.get("status") == "pending":
-                next_task["status"] = "running"
-                next_task["start_ts"] = now_ts
-                next_task["elapsed"] = 0.0
-        elif advance_to_next and idx == len(tasks) - 1:
-            self.active_task_plan["global_status"] = "completed"
-
-        # 如果所有任务都完成，则全局完成。
-        if tasks and all(task.get("status") == "done" for task in tasks):
-            self.active_task_plan["global_status"] = "completed"
-        elif tasks:
-            self.active_task_plan["global_status"] = "running"
-
-        self.active_task_plan["updated_at"] = now_ts
+    def _build_fallback_intention_nl(self, decision: str) -> str:
+        """当LLM未返回intention_nl时，提供稳定保底文本。"""
+        source = "上游mermaid任务" if self.current_mermaid.strip() else "当前视觉场景"
+        return f"当前驾驶意图：{decision}；本轮请求来源：{source}。"
 
     def get_history_summary(self) -> Dict[str, Any]:
         """
@@ -448,7 +389,7 @@ class DeciderAgent:
             "max_image_history": self.max_image_history,
             "image_rounds_stored": image_rounds,
             "memory_enabled": self.enable_memory,
-            "task_plan": self.get_task_plan_state(),
+            "task_context": self.get_task_plan_state(),
             "history": list(self.conversation_history)
         }
 

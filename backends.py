@@ -28,6 +28,7 @@ class DecisionResult:
     """决策结果"""
     analysis: str       # 场景分析
     decision: str       # 决策指令
+    intention_nl: str   # 自然语言意图
     raw_response: str   # 原始响应
     parsed_response: Dict[str, Any]  # 解析后的结构化响应
     task_update: Dict[str, Any]      # 任务状态更新建议
@@ -151,9 +152,11 @@ class LLMBackend(ABC):
         raw_response = self.call_api(images, history, time_info, instructions)
         analysis, decision, parsed_response = self.parse_response(raw_response)
         task_update = parsed_response.get("task_update", {})
+        intention_nl = str(parsed_response.get("intention_nl", "")).strip()
         return DecisionResult(
             analysis=analysis,
             decision=decision,
+            intention_nl=intention_nl,
             raw_response=raw_response,
             parsed_response=parsed_response,
             task_update=task_update,
@@ -371,7 +374,7 @@ class GeminiBackend(LLMBackend):
 class QwenVLBackend(LLMBackend):
     """阿里云通义千问VL后端"""
 
-    def __init__(self, api_key: str, model: str = "qwen-vl-max"):
+    def __init__(self, api_key: str, model: str = "qwen3.6-35b-a3b"):
         super().__init__(api_key, model)
         from openai import OpenAI
         # 通义千问使用OpenAI兼容接口

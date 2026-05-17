@@ -6,9 +6,10 @@ import requests
 import base64
 import sys
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, List
 import numpy as np
 import cv2
+import json
 
 
 class DeciderClient:
@@ -97,7 +98,8 @@ class DeciderClient:
         right: np.ndarray,
         rear: np.ndarray,
         use_base64: bool = True,
-        timestamp: Optional[str] = None
+        timestamp: Optional[str] = None,
+        allowed_decisions: Optional[List[str]] = None
     ) -> dict:
         """
         通过numpy数组进行决策
@@ -109,6 +111,7 @@ class DeciderClient:
             rear: 后置摄像头图像 (H, W, 3) BGR格式
             use_base64: 是否使用Base64模式（True）或文件上传模式（False）
             timestamp: 客户端提供的时间戳（可选）
+            allowed_decisions: 本轮允许的决策集合（可选）
 
         Returns:
             决策结果字典
@@ -141,6 +144,8 @@ class DeciderClient:
             }
             if timestamp:
                 data['timestamp'] = timestamp
+            if allowed_decisions is not None:
+                data['allowed_decisions'] = allowed_decisions
 
             response = self.session.post(f"{self.base_url}/decide/base64", json=data)
             response.raise_for_status()
@@ -156,6 +161,8 @@ class DeciderClient:
             data = {}
             if timestamp:
                 data['timestamp'] = timestamp
+            if allowed_decisions is not None:
+                data['allowed_decisions'] = json.dumps(allowed_decisions, ensure_ascii=False)
 
             response = self.session.post(
                 f"{self.base_url}/decide/upload",

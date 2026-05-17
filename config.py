@@ -9,7 +9,7 @@ from typing import Literal
 BackendType = Literal["anthropic", "openai", "gemini", "qwen", "deepseek"]
 
 # 默认后端
-DEFAULT_BACKEND: BackendType = "anthropic"
+DEFAULT_BACKEND: BackendType = "qwen"
 
 # API密钥配置（优先从环境变量读取）
 API_KEYS = {
@@ -25,12 +25,13 @@ DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
     "gemini": "gemini-1.5-pro",
-    "qwen": "qwen-vl-max",
+    "qwen": "qwen3.6-35b-a3b",
     "deepseek": "deepseek-vl",
 }
 
 # 有效的决策指令
 VALID_DECISIONS = [
+    "PADDING",           # 上层明确要求停车/刹停时使用
     "Lane follow",       # 沿车道线行驶
     "Left change lane",  # 左变道
     "Right change lane", # 右变道
